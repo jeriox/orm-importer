@@ -1,9 +1,12 @@
 from collections import defaultdict
 from typing import Any, List, Optional
+import time
 
 import networkx as nx
 import overpy
+import requests
 from overpy import Node as OverpyNode
+from overpy import exception
 from overpy.exception import DataIncomplete
 from yaramo import model
 from yaramo.edge import Edge
@@ -28,14 +31,85 @@ from orm_importer.utils import (
 )
 
 
+DEFAULT_OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+_OVERPASS_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:157.0) "
+    "Gecko/20100101 Firefox/157.0",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://overpass-turbo.eu/",
+    "Origin": "https://overpass-turbo.eu",
+}
+
+
+class _RequestsOverpass(overpy.Overpass):
+    request_timeout = 180
+
+    def query(self, query):
+        if not isinstance(query, bytes):
+            query = query.encode("utf-8")
+
+        retry_num = 0
+        retry_exceptions = []
+        do_retry = self.max_retry_count > 0
+        while retry_num <= self.max_retry_count:
+            if retry_num > 0:
+                time.sleep(self.retry_timeout)
+            retry_num += 1
+
+            response = requests.post(
+                self.url,
+                data=query,
+                headers=_OVERPASS_HTTP_HEADERS,
+                timeout=self.request_timeout,
+            )
+
+            if response.status_code == 200:
+                content_type = response.headers.get("Content-Type")
+                if content_type == "application/json":
+                    return self.parse_json(response.content)
+                if content_type == "application/osm3s+xml":
+                    return self.parse_xml(response.content)
+                current_exception = exception.OverpassUnknownContentType(content_type)
+            elif response.status_code == 400:
+                msgs = []
+                for msg in self._regex_extract_error_msg.finditer(response.content):
+                    tmp = self._regex_remove_tag.sub(b"", msg.group("msg"))
+                    try:
+                        tmp = tmp.decode("utf-8")
+                    except UnicodeDecodeError:
+                        tmp = repr(tmp)
+                    msgs.append(tmp)
+                current_exception = exception.OverpassBadRequest(query, msgs=msgs)
+            elif response.status_code == 429:
+                current_exception = exception.OverpassTooManyRequests
+            elif response.status_code == 504:
+                current_exception = exception.OverpassGatewayTimeout
+            else:
+                current_exception = exception.OverpassUnknownHTTPStatusCode(
+                    response.status_code
+                )
+
+            if not do_retry:
+                raise current_exception
+            retry_exceptions.append(current_exception)
+
+        raise exception.MaxRetriesReached(
+            retry_count=retry_num, exceptions=retry_exceptions
+        )
+
+
 class ORMImporter:
-    def __init__(self):
+    def __init__(self, overpass_url: str = DEFAULT_OVERPASS_URL):
         self.graph = None
         self.top_nodes: list[OverpyNode] = []
         self.node_data: dict[str, OverpyNode] = {}
         self.ways: dict[str, List[overpy.Way]] = defaultdict(list)
         self.paths: dict[tuple[Optional[Any], Optional[Any]], List[List]] = defaultdict(list)
-        self.api = overpy.Overpass(url="https://osm.hpi.de/overpass/api/interpreter")
+        self.api = _RequestsOverpass(
+            url=overpass_url, max_retry_count=5, retry_timeout=5.0
+        )
         self.topology = Topology()
 
     def _get_track_objects(self, polygon: str, railway_option_types: list[str]):
@@ -46,7 +120,6 @@ class ORMImporter:
                 + f'way["railway"="{_type}"](poly: "{polygon}");node(w)(poly: "{polygon}");'
             )
         query = f"({query_parts});out body;"
-        print(query)
         return self._query_api(query)
 
     def _query_api(self, query):
