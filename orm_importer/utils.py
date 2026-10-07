@@ -110,10 +110,9 @@ def get_signal_states(signal_tags: dict):
     states = set()
     for raw_state in raw_states:
         if raw_state.startswith("DE-ESO:"):
-            try:
-                states.add(SignalState[raw_state.split(":")[1]])
-            except KeyError:
-                continue
+            state = SignalState.get_state_by_string(raw_state.split(":")[1])
+            if state is not None:
+                states.add(state)
     return states
 
 
